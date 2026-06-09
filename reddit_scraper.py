@@ -1,107 +1,31 @@
 #!/usr/bin/env python3
-"""Scrape Reddit comments from a subreddit into a CSV file.
+"""Scrape visible Reddit comments from subreddit HTML pages.
 
-Uses Reddit's JSON endpoints. Reddit commonly blocks anonymous scraping, so
-OAuth app credentials are recommended. Reddit does not reliably expose true
-downvote counts.
+This intentionally does not use Reddit's API or JSON endpoints. It parses
+old.reddit.com HTML, which means Reddit may still block requests and fields
+that are not visible in the page, such as true downvotes, cannot be recovered.
 """
 
 import argparse
-import base64
 import csv
-import json
-import os
 import ssl
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
+from html.parser import HTMLParser
 from typing import Any, Dict, List
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
 
-PUBLIC_BASE_URL = "https://old.reddit.com"
-OAUTH_BASE_URL = "https://oauth.reddit.com"
-TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
-USER_AGENT = "webscraping-research-script/1.0"
+BASE_URL = "https://old.reddit.com"
+USER_AGENT = "Mozilla/5.0 (compatible; research-comment-scraper/1.0)"
 
 
-class RedditClient:
-    def __init__(
-        self,
-        client_id=None,
-        client_secret=None,
-        user_agent=USER_AGENT,
-        verify_ssl=True,
-    ):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.user_agent = user_agent
-        self.verify_ssl = verify_ssl
-        self.access_token = None
-        self.base_url = OAUTH_BASE_URL if client_id and client_secret else PUBLIC_BASE_URL
-
-    def context(self):
-        return None if self.verify_ssl else ssl._create_unverified_context()
-
-    def headers(self):
-        headers = {"User-Agent": self.user_agent}
-        if self.access_token:
-            headers["Authorization"] = "Bearer {0}".format(self.access_token)
-        return headers
-
-    def authenticate(self):
-        if not self.client_id or not self.client_secret:
-            return
-
-        auth = "{0}:{1}".format(self.client_id, self.client_secret).encode("utf-8")
-        headers = {
-            "Authorization": "Basic {0}".format(base64.b64encode(auth).decode("ascii")),
-            "User-Agent": self.user_agent,
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        body = urlencode({"grant_type": "client_credentials"}).encode("utf-8")
-        request = Request(TOKEN_URL, data=body, headers=headers)
-
-        try:
-            with urlopen(request, timeout=30, context=self.context()) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            raise RuntimeError(
-                "Reddit OAuth failed with HTTP {0}: {1}".format(
-                    exc.code, short_error_body(exc)
-                )
-            ) from exc
-        except URLError as exc:
-            raise RuntimeError(
-                "Could not reach Reddit OAuth at {0}: {1}".format(TOKEN_URL, exc.reason)
-            ) from exc
-
-        token = payload.get("access_token")
-        if not token:
-            raise RuntimeError("Reddit OAuth response did not include an access token.")
-        self.access_token = token
-
-    def get(self, path, params=None):
-        if self.client_id and self.client_secret and not self.access_token:
-            self.authenticate()
-
-        query = "?{0}".format(urlencode(params)) if params else ""
-        url = "{0}{1}{2}".format(self.base_url, path, query)
-        request = Request(url, headers=self.headers())
-
-        try:
-            with urlopen(request, timeout=30, context=self.context()) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            raise RuntimeError(
-                "Reddit returned HTTP {0} for {1}: {2}".format(
-                    exc.code, url, short_error_body(exc)
-                )
-            ) from exc
-        except URLError as exc:
-            raise RuntimeError("Could not reach Reddit at {0}: {1}".format(url, exc.reason)) from exc
+def classes(attrs):
+    value = attrs.get("class", "")
+    return set(value.split())
 
 
 def short_error_body(exc):
@@ -111,57 +35,229 @@ def short_error_body(exc):
     return message
 
 
-def iter_subreddit_posts(client, subreddit, sort, post_limit):
+def fetch_html(url, verify_ssl=True):
+    context = None if verify_ssl else ssl._create_unverified_context()
+    request = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=30, context=context) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        raise RuntimeError(
+            "Reddit returned HTTP {0} for {1}: {2}".format(
+                exc.code, url, short_error_body(exc)
+            )
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError("Could not reach Reddit at {0}: {1}".format(url, exc.reason)) from exc
+
+
+class PostListingParser(HTMLParser):
+    def __init__(self):
+        HTMLParser.__init__(self)
+        self.posts = []
+        self.current = None
+        self.div_depth = 0
+        self.capture_title = False
+        self.title_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        class_names = classes(attrs)
+
+        if self.current is not None and tag == "div":
+            self.div_depth += 1
+
+        if tag == "div" and "thing" in class_names and attrs.get("data-type") == "link":
+            self.current = {
+                "post_id": attrs.get("data-fullname", "").replace("t3_", ""),
+                "fullname": attrs.get("data-fullname", ""),
+                "permalink": urljoin(BASE_URL, attrs.get("data-permalink", "")),
+                "title": "",
+            }
+            self.div_depth = 1
+            self.title_parts = []
+            return
+
+        if self.current is None:
+            return
+
+        if tag == "a" and "title" in class_names:
+            self.capture_title = True
+            self.title_parts = []
+
+    def handle_endtag(self, tag):
+        if self.current is None:
+            return
+
+        if tag == "a" and self.capture_title:
+            self.current["title"] = " ".join("".join(self.title_parts).split())
+            self.capture_title = False
+
+        if tag == "div":
+            self.div_depth -= 1
+            if self.div_depth <= 0:
+                if self.current.get("permalink") and self.current.get("post_id"):
+                    self.posts.append(self.current)
+                self.current = None
+                self.capture_title = False
+
+    def handle_data(self, data):
+        if self.capture_title:
+            self.title_parts.append(data)
+
+
+class CommentParser(HTMLParser):
+    def __init__(self, post):
+        HTMLParser.__init__(self)
+        self.post = post
+        self.comments = []
+        self.stack = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        class_names = classes(attrs)
+
+        if tag == "div":
+            for comment in self.stack:
+                comment["depth"] += 1
+
+            if "thing" in class_names and "comment" in class_names:
+                self.stack.append(
+                    {
+                        "depth": 1,
+                        "comment_id": attrs.get("data-fullname", "").replace("t1_", ""),
+                        "subreddit": attrs.get("data-subreddit", ""),
+                        "upvotes": attrs.get("data-ups", ""),
+                        "downvotes": attrs.get("data-downs", ""),
+                        "score": attrs.get("data-score", ""),
+                        "date_posted": "",
+                        "body_parts": [],
+                        "body_depth": 0,
+                        "capture_score": False,
+                    }
+                )
+                return
+
+        if not self.stack:
+            return
+
+        current = self.stack[-1]
+
+        if tag == "time" and not current["date_posted"]:
+            current["date_posted"] = attrs.get("datetime", "")
+
+        if tag == "div" and "score" in class_names and not current["score"]:
+            current["capture_score"] = True
+
+        if tag == "div" and "md" in class_names and current["body_depth"] == 0:
+            current["body_depth"] = 1
+        elif current["body_depth"] > 0 and tag in {"div", "p", "blockquote", "li"}:
+            current["body_depth"] += 1
+
+    def handle_endtag(self, tag):
+        if not self.stack:
+            return
+
+        current = self.stack[-1]
+
+        if tag == "div" and current["capture_score"]:
+            current["capture_score"] = False
+
+        if current["body_depth"] > 0 and tag in {"div", "p", "blockquote", "li"}:
+            current["body_depth"] -= 1
+
+        if tag == "div":
+            for comment in list(self.stack):
+                comment["depth"] -= 1
+
+            while self.stack and self.stack[-1]["depth"] <= 0:
+                finished = self.stack.pop()
+                body = " ".join("".join(finished["body_parts"]).split())
+                if body and body not in {"[deleted]", "[removed]"}:
+                    self.comments.append(
+                        {
+                            "comment_id": finished["comment_id"],
+                            "post_id": self.post["post_id"],
+                            "post_title": self.post["title"],
+                            "post_permalink": self.post["permalink"],
+                            "subreddit": finished["subreddit"],
+                            "comment": body,
+                            "upvotes": finished["upvotes"],
+                            "downvotes": finished["downvotes"],
+                            "score": finished["score"],
+                            "date_posted": normalize_date(finished["date_posted"]),
+                        }
+                    )
+
+    def handle_data(self, data):
+        if not self.stack:
+            return
+
+        current = self.stack[-1]
+        if current["body_depth"] > 0:
+            current["body_parts"].append(data)
+        elif current["capture_score"] and not current["score"]:
+            current["score"] = " ".join(data.split())
+
+
+def normalize_date(value):
+    if not value:
+        return ""
+
+    try:
+        parsed = datetime.strptime(value.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z")
+        return parsed.isoformat()
+    except ValueError:
+        return value
+
+
+def parse_posts(html):
+    parser = PostListingParser()
+    parser.feed(html)
+    return parser.posts
+
+
+def parse_comments(html, post):
+    parser = CommentParser(post)
+    parser.feed(html)
+    return parser.comments
+
+
+def iter_subreddit_posts(subreddit, sort, post_limit, verify_ssl=True):
     fetched = 0
     after = None
 
     while fetched < post_limit:
-        batch_limit = min(100, post_limit - fetched)
-        params = {"limit": batch_limit, "raw_json": 1}
+        params = {"count": fetched}
         if after:
             params["after"] = after
 
-        listing = client.get(
-            f"/r/{subreddit}/{sort}.json",
-            params,
+        url = "{0}/r/{1}/{2}/?{3}".format(
+            BASE_URL,
+            subreddit,
+            sort,
+            urlencode(params),
         )
-        data = listing.get("data", {})
-        children = data.get("children", [])
-
-        if not children:
+        posts = parse_posts(fetch_html(url, verify_ssl=verify_ssl))
+        if not posts:
             break
 
-        for child in children:
-            if child.get("kind") == "t3":
-                fetched += 1
-                yield child["data"]
+        for post in posts:
+            fetched += 1
+            yield post
+            if fetched >= post_limit:
+                break
 
-        after = data.get("after")
+        after = posts[-1].get("fullname")
         if not after:
             break
-
-
-def flatten_comments(children):
-    stack = list(reversed(children))
-
-    while stack:
-        child = stack.pop()
-        if child.get("kind") != "t1":
-            continue
-
-        comment = child.get("data", {})
-        yield comment
-
-        replies = comment.get("replies")
-        if isinstance(replies, dict):
-            reply_children = replies.get("data", {}).get("children", [])
-            stack.extend(reversed(reply_children))
-
-
-def iso_date(timestamp):
-    if timestamp is None:
-        return ""
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
 def scrape_comments(
@@ -171,51 +267,29 @@ def scrape_comments(
     sort: str,
     post_limit: int,
     delay: float,
-    client: RedditClient,
+    verify_ssl: bool,
 ) -> List[Dict[str, Any]]:
     rows = []  # type: List[Dict[str, Any]]
 
-    for post in iter_subreddit_posts(client, subreddit, sort, post_limit):
+    for post in iter_subreddit_posts(subreddit, sort, post_limit, verify_ssl=verify_ssl):
         if len(rows) >= max_comments:
             break
 
-        post_id = post["id"]
-        params = {"limit": 500, "sort": "top", "raw_json": 1}
-        thread = client.get(
-            f"/r/{subreddit}/comments/{post_id}.json",
-            params,
-        )
+        params = urlencode({"limit": 500, "sort": "top"})
+        url = "{0}?{1}".format(post["permalink"], params)
+        comments = parse_comments(fetch_html(url, verify_ssl=verify_ssl), post)
 
-        if len(thread) < 2:
-            continue
-
-        comments = thread[1].get("data", {}).get("children", [])
-        for comment in flatten_comments(comments):
-            body = comment.get("body", "")
-            if not body or body in {"[deleted]", "[removed]"}:
-                continue
-
-            rows.append(
-                {
-                    "comment_id": comment.get("id", ""),
-                    "post_id": post_id,
-                    "post_title": post.get("title", ""),
-                    "post_permalink": f"{PUBLIC_BASE_URL}{post.get('permalink', '')}",
-                    "subreddit": comment.get("subreddit") or subreddit,
-                    "comment": body,
-                    "upvotes": comment.get("ups", ""),
-                    "downvotes": comment.get("downs", ""),
-                    "score": comment.get("score", ""),
-                    "date_posted": iso_date(comment.get("created_utc")),
-                }
-            )
-
+        for comment in comments:
+            if not comment["subreddit"]:
+                comment["subreddit"] = subreddit
+            rows.append(comment)
             if len(rows) >= max_comments:
                 break
 
         time.sleep(delay)
 
     return rows
+
 
 def write_csv(rows, output_path):
     fieldnames = [
@@ -239,7 +313,7 @@ def write_csv(rows, output_path):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Scrape up to 1000 Reddit comments from a specific subreddit."
+        description="Scrape up to 1000 visible Reddit comments from subreddit HTML."
     )
     parser.add_argument("subreddit", help="Subreddit name, without the r/ prefix.")
     parser.add_argument(
@@ -251,7 +325,7 @@ def parse_args():
     parser.add_argument(
         "--max-comments",
         type=int,
-        default=1000,
+        default=10000,
         help="Maximum comments to scrape. Default: 1000.",
     )
     parser.add_argument(
@@ -271,21 +345,6 @@ def parse_args():
         type=float,
         default=1.0,
         help="Seconds to wait between post-comment requests. Default: 1.0.",
-    )
-    parser.add_argument(
-        "--client-id",
-        default=os.environ.get("REDDIT_CLIENT_ID"),
-        help="Reddit app client ID. Can also be set with REDDIT_CLIENT_ID.",
-    )
-    parser.add_argument(
-        "--client-secret",
-        default=os.environ.get("REDDIT_CLIENT_SECRET"),
-        help="Reddit app client secret. Can also be set with REDDIT_CLIENT_SECRET.",
-    )
-    parser.add_argument(
-        "--user-agent",
-        default=os.environ.get("REDDIT_USER_AGENT", USER_AGENT),
-        help="Reddit API user agent. Can also be set with REDDIT_USER_AGENT.",
     )
     parser.add_argument(
         "--insecure",
@@ -309,12 +368,6 @@ def main():
         return 2
 
     output = args.output or f"reddit_{subreddit}_comments.csv"
-    client = RedditClient(
-        client_id=args.client_id,
-        client_secret=args.client_secret,
-        user_agent=args.user_agent,
-        verify_ssl=not args.insecure,
-    )
     try:
         rows = scrape_comments(
             subreddit,
@@ -322,25 +375,23 @@ def main():
             sort=args.sort,
             post_limit=args.post_limit,
             delay=args.delay,
-            client=client,
+            verify_ssl=not args.insecure,
         )
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
-        if not args.client_id or not args.client_secret:
-            print(
-                "Reddit often blocks anonymous JSON scraping with HTTP 403. "
-                "Create a Reddit app and set REDDIT_CLIENT_ID and "
-                "REDDIT_CLIENT_SECRET, or pass --client-id and --client-secret.",
-                file=sys.stderr,
-            )
+        print(
+            "This version does not use Reddit's API. If Reddit returns HTTP 403, "
+            "the site is blocking direct HTML scraping from your network.",
+            file=sys.stderr,
+        )
         print(
             "If this is an SSL certificate error on an old Python install, try "
             "running again with --insecure or update Python's certificates.",
             file=sys.stderr,
         )
         return 1
-    write_csv(rows, output)
 
+    write_csv(rows, output)
     print(f"Wrote {len(rows)} comments to {output}")
     return 0
 

@@ -1,23 +1,8 @@
 # Reddit Comment Scraper
 
-Scrapes comments from a specific subreddit into a CSV file using Reddit's JSON API. It records each comment's text, subreddit, upvotes, downvotes when available, score, and UTC posting date.
+Scrapes visible comments from a specific subreddit into a CSV file by parsing Reddit HTML pages. This version does not use Reddit's API, OAuth, or JSON endpoints.
 
-Reddit often blocks anonymous `.json` scraping with HTTP 403. For reliable runs, create a Reddit API app and run the scraper with OAuth credentials.
-
-## Reddit API Setup
-
-1. Go to <https://www.reddit.com/prefs/apps>.
-2. Click **create another app...**.
-3. Choose **script**.
-4. Set any name, description, and redirect URI. For local scraping, `http://localhost:8080` is fine.
-5. Copy the client ID below the app name and the client secret.
-6. Set them in your terminal:
-
-```bash
-export REDDIT_CLIENT_ID="your_client_id"
-export REDDIT_CLIENT_SECRET="your_client_secret"
-export REDDIT_USER_AGENT="macos:reddit-comment-scraper:v1.0 by /u/your_reddit_username"
-```
+It records each comment's text, subreddit, visible upvote/score fields when present in the page, downvotes when present, and posting date.
 
 ## Usage
 
@@ -26,12 +11,6 @@ python3 reddit_scraper.py AskReddit
 ```
 
 By default this writes up to 1000 comments to `reddit_AskReddit_comments.csv`.
-
-You can also pass credentials directly:
-
-```bash
-python3 reddit_scraper.py AskReddit --client-id YOUR_ID --client-secret YOUR_SECRET
-```
 
 Useful options:
 
@@ -58,4 +37,8 @@ Columns:
 - `score`
 - `date_posted`
 
-Note: Reddit usually exposes comment score/upvotes, but true downvote counts are often hidden or returned as `0`.
+## Notes
+
+Reddit may still block direct HTML scraping with HTTP 403. If that happens, the scraper cannot bypass the block without using an approved API path or a different network.
+
+Reddit does not publicly show true comment downvote counts in normal page HTML, so `downvotes` is often blank.
