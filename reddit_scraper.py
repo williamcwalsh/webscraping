@@ -4,6 +4,7 @@
 This intentionally does not use Reddit's API or JSON endpoints. It parses
 old.reddit.com HTML, which means Reddit may still block requests and fields
 that are not visible in the page, such as true downvotes, cannot be recovered.
+When Reddit includes vote attributes in the HTML, they are written to the CSV.
 """
 
 import argparse
@@ -33,6 +34,25 @@ def short_error_body(exc):
     if len(message) > 500:
         message = message[:500] + "..."
     return message
+
+
+def clean_vote_value(value):
+    if not value:
+        return ""
+
+    value = value.replace(",", "").strip()
+    return value if value.lstrip("-").isdigit() else ""
+
+
+def score_from_text(value):
+    value = " ".join(value.split()).lower()
+    if not value or value in {"score hidden", "[score hidden]"}:
+        return ""
+
+    first_word = value.split()[0].replace(",", "")
+    if first_word.lstrip("-").isdigit():
+        return first_word
+    return ""
 
 
 def fetch_html(url, verify_ssl=True):
@@ -134,13 +154,16 @@ class CommentParser(HTMLParser):
                         "depth": 1,
                         "comment_id": attrs.get("data-fullname", "").replace("t1_", ""),
                         "subreddit": attrs.get("data-subreddit", ""),
-                        "upvotes": attrs.get("data-ups", ""),
-                        "downvotes": attrs.get("data-downs", ""),
-                        "score": attrs.get("data-score", ""),
+                        "upvotes": clean_vote_value(attrs.get("data-ups", "")),
+                        "downvotes": clean_vote_value(attrs.get("data-downs", "")),
+                        "score": clean_vote_value(attrs.get("data-score", "")),
                         "date_posted": "",
                         "body_parts": [],
                         "body_depth": 0,
                         "capture_score": False,
+                        "score_parts": [],
+                        "score_priority": 0,
+                        "pending_score_priority": 0,
                     }
                 )
                 return
@@ -153,8 +176,16 @@ class CommentParser(HTMLParser):
         if tag == "time" and not current["date_posted"]:
             current["date_posted"] = attrs.get("datetime", "")
 
-        if tag == "div" and "score" in class_names and not current["score"]:
+        if tag in {"span", "div"} and "score" in class_names:
+            priority = 1
+            if "likes" in class_names or "dislikes" in class_names:
+                priority = 2
+            if "unvoted" in class_names:
+                priority = 3
+
             current["capture_score"] = True
+            current["score_parts"] = []
+            current["pending_score_priority"] = priority
 
         if tag == "div" and "md" in class_names and current["body_depth"] == 0:
             current["body_depth"] = 1
@@ -167,8 +198,14 @@ class CommentParser(HTMLParser):
 
         current = self.stack[-1]
 
-        if tag == "div" and current["capture_score"]:
+        if tag in {"span", "div"} and current["capture_score"]:
+            score = score_from_text("".join(current["score_parts"]))
+            if score and current["pending_score_priority"] >= current["score_priority"]:
+                current["score"] = score
+                current["score_priority"] = current["pending_score_priority"]
             current["capture_score"] = False
+            current["score_parts"] = []
+            current["pending_score_priority"] = 0
 
         if current["body_depth"] > 0 and tag in {"div", "p", "blockquote", "li"}:
             current["body_depth"] -= 1
@@ -203,8 +240,8 @@ class CommentParser(HTMLParser):
         current = self.stack[-1]
         if current["body_depth"] > 0:
             current["body_parts"].append(data)
-        elif current["capture_score"] and not current["score"]:
-            current["score"] = " ".join(data.split())
+        elif current["capture_score"]:
+            current["score_parts"].append(data)
 
 
 def normalize_date(value):
@@ -325,7 +362,7 @@ def parse_args():
     parser.add_argument(
         "--max-comments",
         type=int,
-        default=10000,
+        default=15000,
         help="Maximum comments to scrape. Default: 1000.",
     )
     parser.add_argument(

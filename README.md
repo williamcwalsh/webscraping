@@ -42,3 +42,32 @@ Columns:
 Reddit may still block direct HTML scraping with HTTP 403. If that happens, the scraper cannot bypass the block without using an approved API path or a different network.
 
 Reddit does not publicly show true comment downvote counts in normal page HTML, so `downvotes` is often blank.
+
+## User Comments In One Subreddit
+
+To scrape comments from a specific user in a specific subreddit:
+
+```bash
+python3 reddit_user_subreddit_scraper.py username AskReddit
+```
+
+By default this paginates through the user's visible comment history and writes up to 100 matching comments to `reddit_<username>_<subreddit>_comments.csv`.
+
+Useful options:
+
+```bash
+python3 reddit_user_subreddit_scraper.py username learnpython --max-comments 50 --output user_learnpython_comments.csv
+```
+
+Columns:
+
+- `comment_id`
+- `post_id`
+- `post_title`
+- `post_permalink`
+- `subreddit`
+- `comment`
+- `score`
+- `date_posted`
+
+This user/subreddit scraper keeps only `score`, not separate `upvotes` or `downvotes`.
