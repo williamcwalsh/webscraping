@@ -16,7 +16,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 from typing import Any, Dict, List
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin
+from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -55,10 +55,24 @@ def score_from_text(value):
     return ""
 
 
+def url_for_request(url):
+    parts = urlsplit(url)
+    netloc = parts.netloc.encode("idna").decode("ascii")
+    return urlunsplit(
+        (
+            parts.scheme,
+            netloc,
+            quote(parts.path, safe="/%"),
+            quote(parts.query, safe="=&%:+,/?"),
+            quote(parts.fragment, safe="=&%:+,/?"),
+        )
+    )
+
+
 def fetch_html(url, verify_ssl=True):
     context = None if verify_ssl else ssl._create_unverified_context()
     request = Request(
-        url,
+        url_for_request(url),
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml",
@@ -362,7 +376,7 @@ def parse_args():
     parser.add_argument(
         "--max-comments",
         type=int,
-        default=15000,
+        default=1000,
         help="Maximum comments to scrape. Default: 1000.",
     )
     parser.add_argument(
