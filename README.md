@@ -59,6 +59,11 @@ Useful options:
 python3 reddit_user_subreddit_scraper.py username learnpython --max-comments 50 --output user_learnpython_comments.csv
 ```
 
+If this command returns HTTP 404 for the `/user/<username>/comments/` URL,
+old Reddit did not return a public comment listing for that username. Check the
+spelling first; the account may also be deleted, suspended, or unavailable on
+old Reddit.
+
 Columns:
 
 - `comment_id`

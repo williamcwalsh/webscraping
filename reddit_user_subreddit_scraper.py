@@ -80,6 +80,12 @@ def fetch_html(url: str, verify_ssl: bool = True) -> str:
         with urlopen(request, timeout=30, context=context) as response:
             return response.read().decode("utf-8", errors="replace")
     except HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError(
+                "Reddit returned HTTP 404 for {0}. Reddit did not return a public "
+                "comment listing for that user; check the username spelling, or the "
+                "account may be deleted, suspended, or unavailable on old Reddit.".format(url)
+            ) from exc
         raise RuntimeError(
             "Reddit returned HTTP {0} for {1}: {2}".format(
                 exc.code, url, short_error_body(exc)
