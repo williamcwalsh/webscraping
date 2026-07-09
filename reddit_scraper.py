@@ -9,6 +9,7 @@ When Reddit includes vote attributes in the HTML, they are written to the CSV.
 
 import argparse
 import csv
+import os
 import ssl
 import sys
 import time
@@ -22,6 +23,21 @@ from urllib.request import Request, urlopen
 
 BASE_URL = "https://old.reddit.com"
 USER_AGENT = "Mozilla/5.0 (compatible; research-comment-scraper/1.0)"
+DEFAULT_RATE_LIMIT_RETRIES = 5
+DEFAULT_RATE_LIMIT_DELAY = 60.0
+RATE_LIMIT_BACKOFF = 2.0
+FIELDNAMES = [
+    "comment_id",
+    "post_id",
+    "post_title",
+    "post_permalink",
+    "subreddit",
+    "comment",
+    "upvotes",
+    "downvotes",
+    "score",
+    "date_posted",
+]
 
 
 def classes(attrs):
@@ -69,7 +85,25 @@ def url_for_request(url):
     )
 
 
-def fetch_html(url, verify_ssl=True):
+def retry_after_seconds(exc, fallback):
+    headers = exc.headers or {}
+    value = headers.get("Retry-After", "").strip()
+    if not value:
+        return fallback
+
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        return fallback
+
+
+def fetch_html(
+    url,
+    verify_ssl=True,
+    *,
+    rate_limit_retries=DEFAULT_RATE_LIMIT_RETRIES,
+    rate_limit_delay=DEFAULT_RATE_LIMIT_DELAY,
+):
     context = None if verify_ssl else ssl._create_unverified_context()
     request = Request(
         url_for_request(url),
@@ -79,17 +113,46 @@ def fetch_html(url, verify_ssl=True):
         },
     )
 
-    try:
-        with urlopen(request, timeout=30, context=context) as response:
-            return response.read().decode("utf-8", errors="replace")
-    except HTTPError as exc:
-        raise RuntimeError(
-            "Reddit returned HTTP {0} for {1}: {2}".format(
-                exc.code, url, short_error_body(exc)
-            )
-        ) from exc
-    except URLError as exc:
-        raise RuntimeError("Could not reach Reddit at {0}: {1}".format(url, exc.reason)) from exc
+    for attempt in range(rate_limit_retries + 1):
+        try:
+            with urlopen(request, timeout=30, context=context) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            if exc.code == 429:
+                if attempt >= rate_limit_retries:
+                    raise RuntimeError(
+                        "Reddit returned HTTP 429 for {0}. Reddit is rate limiting "
+                        "these requests after {1} retries; try again later or use a "
+                        "larger --delay / --batch-delay / --rate-limit-delay.".format(
+                            url,
+                            rate_limit_retries,
+                        )
+                    ) from exc
+
+                fallback_delay = rate_limit_delay * (RATE_LIMIT_BACKOFF ** attempt)
+                wait_seconds = retry_after_seconds(exc, fallback_delay)
+                print(
+                    "Reddit returned HTTP 429 for {0}; waiting {1:.1f} seconds "
+                    "before retry {2}/{3}.".format(
+                        url,
+                        wait_seconds,
+                        attempt + 1,
+                        rate_limit_retries,
+                    ),
+                    file=sys.stderr,
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            raise RuntimeError(
+                "Reddit returned HTTP {0} for {1}: {2}".format(
+                    exc.code, url, short_error_body(exc)
+                )
+            ) from exc
+        except URLError as exc:
+            raise RuntimeError("Could not reach Reddit at {0}: {1}".format(url, exc.reason)) from exc
+
+    raise RuntimeError("Could not fetch Reddit page at {0}".format(url))
 
 
 class PostListingParser(HTMLParser):
@@ -281,7 +344,14 @@ def parse_comments(html, post):
     return parser.comments
 
 
-def iter_subreddit_posts(subreddit, sort, post_limit, verify_ssl=True):
+def iter_subreddit_posts(
+    subreddit,
+    sort,
+    post_limit,
+    verify_ssl=True,
+    rate_limit_retries=DEFAULT_RATE_LIMIT_RETRIES,
+    rate_limit_delay=DEFAULT_RATE_LIMIT_DELAY,
+):
     fetched = 0
     after = None
 
@@ -296,7 +366,14 @@ def iter_subreddit_posts(subreddit, sort, post_limit, verify_ssl=True):
             sort,
             urlencode(params),
         )
-        posts = parse_posts(fetch_html(url, verify_ssl=verify_ssl))
+        posts = parse_posts(
+            fetch_html(
+                url,
+                verify_ssl=verify_ssl,
+                rate_limit_retries=rate_limit_retries,
+                rate_limit_delay=rate_limit_delay,
+            )
+        )
         if not posts:
             break
 
@@ -316,21 +393,46 @@ def scrape_comments(
     *,
     max_comments: int,
     sort: str,
+    comment_sort: str,
     post_limit: int,
     delay: float,
     verify_ssl: bool,
+    skip_comment_ids=None,
+    rate_limit_retries: int = DEFAULT_RATE_LIMIT_RETRIES,
+    rate_limit_delay: float = DEFAULT_RATE_LIMIT_DELAY,
 ) -> List[Dict[str, Any]]:
     rows = []  # type: List[Dict[str, Any]]
+    seen_comment_ids = set(skip_comment_ids or [])
 
-    for post in iter_subreddit_posts(subreddit, sort, post_limit, verify_ssl=verify_ssl):
+    for post in iter_subreddit_posts(
+        subreddit,
+        sort,
+        post_limit,
+        verify_ssl=verify_ssl,
+        rate_limit_retries=rate_limit_retries,
+        rate_limit_delay=rate_limit_delay,
+    ):
         if len(rows) >= max_comments:
             break
 
-        params = urlencode({"limit": 500, "sort": "top"})
+        params = urlencode({"limit": 500, "sort": comment_sort})
         url = "{0}?{1}".format(post["permalink"], params)
-        comments = parse_comments(fetch_html(url, verify_ssl=verify_ssl), post)
+        comments = parse_comments(
+            fetch_html(
+                url,
+                verify_ssl=verify_ssl,
+                rate_limit_retries=rate_limit_retries,
+                rate_limit_delay=rate_limit_delay,
+            ),
+            post,
+        )
 
         for comment in comments:
+            comment_id = comment["comment_id"]
+            if comment_id in seen_comment_ids:
+                continue
+
+            seen_comment_ids.add(comment_id)
             if not comment["subreddit"]:
                 comment["subreddit"] = subreddit
             rows.append(comment)
@@ -342,23 +444,32 @@ def scrape_comments(
     return rows
 
 
-def write_csv(rows, output_path):
-    fieldnames = [
-        "comment_id",
-        "post_id",
-        "post_title",
-        "post_permalink",
-        "subreddit",
-        "comment",
-        "upvotes",
-        "downvotes",
-        "score",
-        "date_posted",
-    ]
+def read_existing_comment_ids(output_path):
+    comment_ids = set()
+    try:
+        with open(output_path, newline="", encoding="utf-8") as csv_file:
+            reader = csv.DictReader(csv_file)
+            for row in reader:
+                comment_id = row.get("comment_id", "").strip()
+                if comment_id:
+                    comment_ids.add(comment_id)
+    except FileNotFoundError:
+        pass
 
-    with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
+    return comment_ids
+
+
+def write_csv(rows, output_path, append=False):
+    write_header = True
+    mode = "w"
+    if append:
+        mode = "a"
+        write_header = not os.path.exists(output_path) or os.path.getsize(output_path) == 0
+
+    with open(output_path, mode, newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=FIELDNAMES)
+        if write_header:
+            writer.writeheader()
         writer.writerows(rows)
 
 
@@ -386,6 +497,12 @@ def parse_args():
         help="Post listing to scrape. Default: hot.",
     )
     parser.add_argument(
+        "--comment-sort",
+        choices=("confidence", "top", "new", "controversial", "old", "qa"),
+        default="top",
+        help="Comment sort to request on each inspected post. Default: top.",
+    )
+    parser.add_argument(
         "--post-limit",
         type=int,
         default=100,
@@ -396,6 +513,40 @@ def parse_args():
         type=float,
         default=1.0,
         help="Seconds to wait between post-comment requests. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append new comments to the output CSV and skip comment IDs already present.",
+    )
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Keep scraping batches until stopped. Implies --append.",
+    )
+    parser.add_argument(
+        "--batch-delay",
+        type=float,
+        default=1800.0,
+        help="Seconds to wait between continuous batches. Default: 1800.",
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=0,
+        help="Maximum continuous batches to run. Default: 0, meaning no batch cap.",
+    )
+    parser.add_argument(
+        "--rate-limit-retries",
+        type=int,
+        default=DEFAULT_RATE_LIMIT_RETRIES,
+        help="Number of times to retry a request after HTTP 429. Default: 5.",
+    )
+    parser.add_argument(
+        "--rate-limit-delay",
+        type=float,
+        default=DEFAULT_RATE_LIMIT_DELAY,
+        help="Initial seconds to wait after HTTP 429 when Reddit does not send Retry-After. Default: 60.",
     )
     parser.add_argument(
         "--insecure",
@@ -417,33 +568,102 @@ def main():
     if args.post_limit < 1:
         print("--post-limit must be at least 1", file=sys.stderr)
         return 2
+    if args.delay < 0:
+        print("--delay must be 0 or greater", file=sys.stderr)
+        return 2
+    if args.batch_delay < 0:
+        print("--batch-delay must be 0 or greater", file=sys.stderr)
+        return 2
+    if args.max_batches < 0:
+        print("--max-batches must be 0 or greater", file=sys.stderr)
+        return 2
+    if args.rate_limit_retries < 0:
+        print("--rate-limit-retries must be 0 or greater", file=sys.stderr)
+        return 2
+    if args.rate_limit_delay < 0:
+        print("--rate-limit-delay must be 0 or greater", file=sys.stderr)
+        return 2
 
     output = args.output or f"reddit_{subreddit}_comments.csv"
-    try:
-        rows = scrape_comments(
-            subreddit,
-            max_comments=args.max_comments,
-            sort=args.sort,
-            post_limit=args.post_limit,
-            delay=args.delay,
-            verify_ssl=not args.insecure,
-        )
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        print(
-            "This version does not use Reddit's API. If Reddit returns HTTP 403, "
-            "the site is blocking direct HTML scraping from your network.",
-            file=sys.stderr,
-        )
-        print(
-            "If this is an SSL certificate error on an old Python install, try "
-            "running again with --insecure or update Python's certificates.",
-            file=sys.stderr,
-        )
-        return 1
+    append = args.append or args.continuous
+    seen_comment_ids = read_existing_comment_ids(output) if append else set()
+    batch_number = 0
 
-    write_csv(rows, output)
-    print(f"Wrote {len(rows)} comments to {output}")
+    try:
+        while True:
+            batch_number += 1
+            try:
+                rows = scrape_comments(
+                    subreddit,
+                    max_comments=args.max_comments,
+                    sort=args.sort,
+                    comment_sort=args.comment_sort,
+                    post_limit=args.post_limit,
+                    delay=args.delay,
+                    verify_ssl=not args.insecure,
+                    skip_comment_ids=seen_comment_ids,
+                    rate_limit_retries=args.rate_limit_retries,
+                    rate_limit_delay=args.rate_limit_delay,
+                )
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                print(
+                    "This version does not use Reddit's API. If Reddit returns HTTP 429, "
+                    "the site is rate limiting direct HTML scraping from your network. "
+                    "Try again later or use a larger --delay / --batch-delay.",
+                    file=sys.stderr,
+                )
+                print(
+                    "If Reddit returns HTTP 403, the site is blocking direct HTML scraping "
+                    "from your network.",
+                    file=sys.stderr,
+                )
+                print(
+                    "If this is an SSL certificate error on an old Python install, try "
+                    "running again with --insecure or update Python's certificates.",
+                    file=sys.stderr,
+                )
+
+                if not args.continuous:
+                    return 1
+
+                print(
+                    "Batch {0} failed; waiting {1:.1f} seconds before trying again.".format(
+                        batch_number,
+                        args.batch_delay,
+                    ),
+                    file=sys.stderr,
+                )
+                time.sleep(args.batch_delay)
+                if args.max_batches and batch_number >= args.max_batches:
+                    break
+                continue
+
+            write_csv(rows, output, append=append)
+            for row in rows:
+                comment_id = row.get("comment_id", "")
+                if comment_id:
+                    seen_comment_ids.add(comment_id)
+
+            verb = "Appended" if append else "Wrote"
+            print("{0} {1} comments to {2}".format(verb, len(rows), output))
+
+            if not args.continuous:
+                return 0
+            if args.max_batches and batch_number >= args.max_batches:
+                break
+
+            print(
+                "Batch {0} complete; waiting {1:.1f} seconds before the next batch.".format(
+                    batch_number,
+                    args.batch_delay,
+                )
+            )
+            time.sleep(args.batch_delay)
+    except KeyboardInterrupt:
+        print("Stopped by user.", file=sys.stderr)
+        return 130
+
     return 0
 
 

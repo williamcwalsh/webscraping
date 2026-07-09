@@ -18,6 +18,18 @@ Useful options:
 python3 reddit_scraper.py learnpython --sort new --max-comments 1000 --post-limit 200 --output learnpython_comments.csv
 ```
 
+To keep collecting throughout the day, run in continuous append mode. This
+writes up to 1000 new comments per batch, skips comment IDs already present in
+the CSV, and sleeps between batches:
+
+```bash
+python3 reddit_scraper.py Embedded --sort new --continuous --delay 5 --batch-delay 1800 --rate-limit-retries 8 --rate-limit-delay 120
+```
+
+Use `Ctrl+C` to stop a continuous run. The scraper honors HTTP 429 rate-limit
+responses by waiting and retrying, but direct HTML scraping can still be blocked
+or rate limited by Reddit.
+
 If an older local Python install fails with an SSL certificate verification error, either update Python's certificates or run:
 
 ```bash
@@ -76,3 +88,36 @@ Columns:
 - `date_posted`
 
 This user/subreddit scraper keeps only `score`, not separate `upvotes` or `downvotes`.
+
+## Active Users In One Subreddit
+
+To find users with at least 100 visible comments in a subreddit:
+
+```bash
+python3 reddit_active_users_scraper.py AskReddit
+```
+
+By default this checks up to 1000 unique usernames while inspecting up to 500
+recent posts, then writes up to 100 qualifying users to
+`reddit_<subreddit>_active_users.csv`.
+
+Useful options:
+
+```bash
+python3 reddit_active_users_scraper.py learnpython --max-users-checked 2000 --max-users-recorded 50 --post-limit 1000
+```
+
+If Reddit returns HTTP 429, it is rate limiting the scraper. The active-user
+scraper retries 429 responses by default, but a slower run is usually gentler:
+
+```bash
+python3 reddit_active_users_scraper.py embedded --delay 5 --rate-limit-retries 8 --rate-limit-delay 90
+```
+
+Columns:
+
+- `username`
+- `comment_count`
+
+This scraper counts visible comments on the inspected post pages. Comments
+hidden behind Reddit's "load more comments" controls are not included.
